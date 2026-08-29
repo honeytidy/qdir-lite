@@ -834,7 +834,25 @@ class Pane(ttk.Frame):
         self._rename_candidate = None
         if cand and self.tree.identify_row(event.y) == cand \
                 and list(self.tree.selection()) == [cand]:
-            self._begin_rename(cand)
+            # 延迟到超过双击间隔后才真正进入改名：若用户是要双击打开，
+            # Double-1 会先到并取消本次改名（与资源管理器行为一致）
+            delay = _user32.GetDoubleClickTime() + 120
+            self._rename_timer = self.after(delay, self._rename_if_still, cand)
+
+    def _cancel_pending_rename(self):
+        tid = getattr(self, "_rename_timer", None)
+        if tid:
+            self._rename_timer = None
+            try:
+                self.after_cancel(tid)
+            except Exception:
+                pass
+
+    def _rename_if_still(self, iid):
+        """延迟到点时再次确认：项仍存在且仍是唯一选中项，才进入改名"""
+        self._rename_timer = None
+        if self.tree.exists(iid) and list(self.tree.selection()) == [iid]:
+            self._begin_rename(iid)
 
     # ---------- 事件 ----------
     def _on_path_enter(self, event):
@@ -856,6 +874,7 @@ class Pane(ttk.Frame):
         return "break"
 
     def _on_double_click(self, event):
+        self._cancel_pending_rename()  # 双击优先于慢双击改名
         row = self.tree.identify_row(event.y)
         if row:
             self.open_item(row)
