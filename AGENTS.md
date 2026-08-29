@@ -38,6 +38,7 @@ python -m py_compile qdir_lite.py fileicons.py          # 语法检查
 16. **剪切项置灰**：全局 `_CUT_PATHS` + tree tag `cut`（灰前景），`_fill` 和 `apply_cut_tags()` 两处同步；Ctrl+C 或剪切粘贴完成后清除
 17. **目录空白处右键（"新建"子菜单）**：对选中项 `GetUIObjectOf` 拿到的是项目菜单，永远没有"新建"；但直接弹 `CreateViewObject(IID_IContextMenu)`（vtable 8，先 `SHBindToObject` 目录本身；`GetUIObjectOf(cidl=0)` 实测 E_INVALIDARG）的背景菜单会让 PS7 等**第三方扩展子菜单全空白**——该聚合对象不路由 WM_INITMENUPOPUP。最终方案 = **合并**：主菜单用目录作为子项的项目菜单（扩展转发正常），另把背景菜单用独立 id 段（0x8000~0xDFFF）QueryContextMenu 后 `RemoveMenu` 拆出"新建"子菜单 `InsertMenu(MF_POPUP)` 插进主菜单；菜单消息**向两个 pcm 都转发**（实测互不干扰）；invoke 按 id 段选 pcm，背景侧必须带 `lpDirectoryW` + `fMask=CMIC_MASK_UNICODE`。`CDefFolderMenu_Create2`/`SHCreateDefaultContextMenu` 都试过：cidl=0 时要么空菜单要么丢静态 verb，不可用
 18. **重命名**：原生菜单要加 `CMF_CANRENAME` 标志才有"重命名"项；shell 的 `rename` verb 在没有 IShellView 的程序里 invoke 是**空操作**，须用 `GetCommandString(GCS_VERBA)` 识别后自实现行内改名（Entry 覆盖 `tree.bbox(iid,"#0")` 文字区，文件只选中主名）。坑：该聚合对象 GCS_VERBW 错误返回帮助文本，**GCS_VERBA 实际按 UTF-16 写规范名**（rename/delete/properties）；新建后进入改名 = 菜单执行前后 diff 目录项找出新文件；慢双击改名 = `_on_press_1` 记录上次点击，间隔 > `GetDoubleClickTime()` 且唯一选中的同一行再次被单击（无拖动）才触发。测试注意：tk `event_generate("<Return>")` 不触发 "<Return>" 绑定，要用 `"<KeyPress-Return>", when="now"` 且先 `focus_force()`
+19. **删除只读文件报 WinError 5**：git 的 `.git/objects/pack/*` 等只读文件直接 `os.remove`/`shutil.rmtree` 必拒绝访问；`_menu_delete` 用 `rmtree(onexc=...)`（3.12+）清只读属性后重试，单文件捕获 `PermissionError` 后 `chmod 0o666` 再删
 
 ## 界面约定（用户已定型的偏好，勿回退）
 

@@ -1089,13 +1089,24 @@ class Pane(ttk.Frame):
             msg = f"将永久删除选中的 {len(sel)} 个项目\n\n（不进入回收站）"
         if not messagebox.askyesno("确认删除", msg, icon="warning", parent=self):
             return
+        def _force(func, p2, _exc):
+            # 只读文件（如 git pack 的 .idx/.pack）直接删会 WinError 5，先清只读再重试
+            try:
+                os.chmod(p2, 0o666)
+            except OSError:
+                pass
+            func(p2)
         failed = []
         for p in sel:
             try:
                 if os.path.isdir(p):
-                    shutil.rmtree(p)
+                    shutil.rmtree(p, onexc=_force)
                 else:
-                    os.remove(p)
+                    try:
+                        os.remove(p)
+                    except PermissionError:
+                        os.chmod(p, 0o666)
+                        os.remove(p)
             except OSError as e:
                 failed.append(f"{p}\n{e}")
         self.refresh()
