@@ -195,20 +195,3 @@ def peek_photo(key):
     photo = tk.PhotoImage(data=base64.b64encode(png)) if png else None
     _photo_cache[key] = photo
     return photo
-
-
-def shell_icon(path, is_dir):
-    """同步获取与资源管理器一致的小图标（tk.PhotoImage），失败返回 None。
-
-    用真实路径查询（不带 USEFILEATTRIBUTES），Shell 会解析文件类型的
-    程序关联，返回与其"打开方式"一致的图标，和资源管理器完全同款。
-    """
-    try:
-        key = icon_key(path, is_dir)
-        photo = peek_photo(key)
-        if photo is NOT_READY:
-            fetch_icons([(key, path)])
-            photo = peek_photo(key)
-        return photo
-    except Exception:
-        return None

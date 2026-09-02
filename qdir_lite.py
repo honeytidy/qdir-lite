@@ -174,6 +174,10 @@ _user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 _user32.InvalidateRect.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL]
 _user32.UpdateWindow.argtypes = [ctypes.c_void_p]
 _user32.FrameRect.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+_shell32 = ctypes.windll.shell32
+_shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                    wintypes.LPWSTR, ctypes.c_uint]
+_shell32.DragQueryFileW.restype = ctypes.c_uint
 
 
 # ---------- 橡皮筋选框（GDI 直接画在列表控件 DC 上，资源管理器同款） ----------
@@ -248,9 +252,8 @@ def _drop_effect_fmt():
 
 def _open_clipboard():
     """打开剪贴板，被占用时短暂重试"""
-    u32 = ctypes.windll.user32
     for _ in range(10):
-        if u32.OpenClipboard(None):
+        if _user32.OpenClipboard(None):
             return True
         time.sleep(0.02)
     return False
@@ -286,8 +289,7 @@ def set_clipboard_files(paths, cut=False):
             if p:
                 ctypes.memmove(p, struct.pack("<I", 2 if cut else 1), 4)
                 k32.GlobalUnlock(heffect)
-            if not u32.SetClipboardData(_DROP_EFFECT_FMT or _drop_effect_fmt(),
-                                        heffect):
+            if not u32.SetClipboardData(_drop_effect_fmt(), heffect):
                 k32.GlobalFree(heffect)
         return True
     finally:
@@ -299,10 +301,6 @@ def set_clipboard_files(paths, cut=False):
 def get_clipboard_files():
     """读取剪贴板里的文件列表；返回 (paths, is_cut)，没有文件则返回 None"""
     u32, k32 = _user32, _kernel32
-    sh32 = ctypes.windll.shell32
-    sh32.DragQueryFileW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
-                                    wintypes.LPWSTR, ctypes.c_uint]
-    sh32.DragQueryFileW.restype = ctypes.c_uint
     if not u32.IsClipboardFormatAvailable(_CF_HDROP):
         return None
     if not _open_clipboard():
@@ -312,10 +310,10 @@ def get_clipboard_files():
         if not h:
             return None
         paths = []
-        for i in range(sh32.DragQueryFileW(h, 0xFFFFFFFF, None, 0)):
-            n = sh32.DragQueryFileW(h, i, None, 0)
+        for i in range(_shell32.DragQueryFileW(h, 0xFFFFFFFF, None, 0)):
+            n = _shell32.DragQueryFileW(h, i, None, 0)
             buf = ctypes.create_unicode_buffer(n + 1)
-            sh32.DragQueryFileW(h, i, buf, n + 1)
+            _shell32.DragQueryFileW(h, i, buf, n + 1)
             paths.append(buf.value)
         if not paths:
             return None
@@ -368,6 +366,13 @@ def category_of(path, is_dir):
     if is_dir:
         return "folder"
     return EXT_MAP.get(os.path.splitext(path)[1].lower(), "file")
+
+
+_SORT_KEYS = {
+    "#0": lambda e: e["name"].lower(),
+    "size": lambda e: e["size"],
+    "mtime": lambda e: e["mtime"],
+}
 
 
 def fmt_size(n):
@@ -482,11 +487,27 @@ class MiniScrollbar(tk.Canvas):
 class Pane(ttk.Frame):
     """单个文件浏览窗格"""
 
-    def __init__(self, master, app, start_path):
+    def __init__(self, master, app, start_path, sort_col="#0", sort_reverse=False):
         super().__init__(master, relief="flat", borderwidth=0)
         self.app = app
         self.path = os.path.abspath(start_path)
+        # 后退/前进历史栈（浏览器式语义）：_hist_i 指向当前所在项
+        self._hist = [self.path]
+        self._hist_i = 0
         self._status_text = ""
+        self.sort_col = sort_col        # 当前排序列：#0=名称 / size=大小 / mtime=修改时间
+        self.sort_reverse = sort_reverse
+        self._entries = []              # 当前目录扫描结果（refresh 填充）
+        self._last_refresh_path = None  # 上次刷新的目录（同目录刷新时保留滚动/选中）
+        self._dir_mtime = None          # 目录 mtime，供外部改动轮询对比
+        self._icon_gen = 0              # 图标加载代次号，过期结果丢弃
+        self._pending_icons = {}        # 等待后台抓取的图标 key -> [iid, ...]
+        self._drag = None               # 框选拖动状态
+        self._last_click = (None, 0.0)  # 上次单击的 (行, 时间)，慢双击改名用
+        self._rename_candidate = None   # 慢双击改名的候选行
+        self._rename_timer = None       # 延迟进入改名的 after id
+        self._rename_entry = None       # 行内改名的 Entry，None=未在改名
+        self._paste_busy = False        # 上一次粘贴还在后台跑
         self._build_header()
         self._build_tree()
         self._build_menu()
@@ -507,6 +528,20 @@ class Pane(ttk.Frame):
         self.path_var = tk.StringVar(value=self.path)
         self.entry_frame = tk.Frame(self.header, bg="white",
                                     highlightbackground="#c5d3e8", highlightthickness=1)
+        # 历史记录下拉按钮：在地址栏右端，随地址栏一起显隐，不额外占空间。
+        # 用 Label 而不是 Button——Button 内部上下 padding 会撑高 entry_frame，
+        # 而 Entry 只做水平填充，会在地址栏内容下方留出空白
+        self.hist_btn = tk.Label(self.entry_frame, text="▾", bd=0, bg="white",
+                                 font=(FONT_FAMILY, FONT_SIZE), padx=3, pady=0,
+                                 cursor="hand2")
+        self.hist_btn.pack(side="right", fill="y")
+        self.hist_btn.bind("<Button-1>",
+                           lambda e: (self._toggle_history_dropdown(), "break")[1])
+        self.hist_btn.bind("<Enter>",
+                           lambda e: self.hist_btn.configure(bg="#e2ecf9"))
+        self.hist_btn.bind("<Leave>",
+                           lambda e: self.hist_btn.configure(bg="white"))
+        self._hist_pop = None  # 历史下拉浮层（Toplevel），None=未展开
         # 地址栏默认不 pack（隐藏），Ctrl+左键点击窗格时才显示
         self.path_entry = tk.Entry(self.entry_frame, textvariable=self.path_var, bd=0,
                                    font=(FONT_FAMILY, FONT_SIZE), highlightthickness=0)
@@ -514,6 +549,18 @@ class Pane(ttk.Frame):
         self.path_entry.bind("<Return>", self._on_path_enter)
         self.path_entry.bind("<Escape>", self._on_path_escape)
         self.path_entry.bind("<Double-1>", lambda e: self.app.toggle_maximize(self))
+        self.path_entry.bind("<Alt-Left>", lambda e: self.go_back())
+        self.path_entry.bind("<Alt-Right>", lambda e: self.go_forward())
+        # 历史下拉：↓/F4/Alt+↓ 展开，↑↓ 移动选项，键入即过滤（浏览器式）
+        self.path_entry.bind("<Down>", self._on_path_down)
+        self.path_entry.bind("<Up>", self._on_path_up)
+        self.path_entry.bind("<F4>", lambda e: self._toggle_history_dropdown() or "break")
+        self.path_entry.bind("<Alt-Down>",
+                             lambda e: self._toggle_history_dropdown() or "break")
+        self.path_entry.bind("<KeyRelease>", self._on_path_keyrelease, add="+")
+        # 焦点离开地址栏（且不是去了下拉列表/▾按钮）时收起下拉
+        self.path_entry.bind("<FocusOut>",
+                             lambda e: self.after_idle(self._hist_focus_check), add="+")
 
         # 双击标题栏空白区 -> 最大化/还原
         self.header.bind("<Double-1>", lambda e: self.app.toggle_maximize(self))
@@ -529,13 +576,11 @@ class Pane(ttk.Frame):
         self.path_entry.select_range(0, "end")
 
     def hide_address(self):
+        self._close_history_dropdown()
         # 地址栏在标题栏内部，隐藏标题栏即整块收起
         self.header.pack_forget()
 
     def _build_tree(self):
-        self.sort_col = "#0"        # 当前排序列：#0=名称 / size=大小 / mtime=修改时间
-        self.sort_reverse = False
-        self._entries = []
         self._heading_texts = {"#0": "名称", "size": "大小", "mtime": "修改时间"}
 
         cols = ("size", "mtime")
@@ -557,7 +602,7 @@ class Pane(ttk.Frame):
                       relheight=1.0, width=S(4))
         self.sb.tk.call("raise", self.sb._w, self.tree._w)  # 浮于列表之上
 
-        # 类型颜色 + 隔行条纹 + 剪切置灰
+        # 隔行条纹 + 剪切置灰
         self.tree.tag_configure("stripe", background="#f5f8fc")
         self.tree.tag_configure("cut", foreground="#a8b0bc")
 
@@ -567,7 +612,6 @@ class Pane(ttk.Frame):
         self.tree.bind("<Button-3>", self._on_right_click)
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._update_status())
         # 按住左键拖动：画出资源管理器式矩形选框，框住的行即被选中
-        self._drag = None
         self.tree.bind("<ButtonPress-1>", self._on_press_1, add="+")
         self.tree.bind("<B1-Motion>", self._on_drag_1)
         self.tree.bind("<ButtonRelease-1>", self._on_release_1)
@@ -583,6 +627,9 @@ class Pane(ttk.Frame):
         for seq in ("<Control-e>", "<Control-E>"):
             self.tree.bind(seq, lambda e: self._open_in_explorer())
         self.tree.bind("<Delete>", lambda e: self._menu_delete())
+        # 历史记录后退/前进，与资源管理器一致
+        self.tree.bind("<Alt-Left>", lambda e: self.go_back())
+        self.tree.bind("<Alt-Right>", lambda e: self.go_forward())
 
     def _build_menu(self):
         self.menu = tk.Menu(self, tearoff=0, font=(FONT_FAMILY, FONT_SIZE))
@@ -612,7 +659,7 @@ class Pane(ttk.Frame):
             self.path = parent
         self.path_var.set(self.path)
         # 同目录刷新（自动刷新/粘贴后）时保留滚动位置和选中项，不打断浏览
-        keep = self.path == getattr(self, "_last_refresh_path", None)
+        keep = self.path == self._last_refresh_path
         sel = self.tree.selection() if keep else ()
         top = self.tree.yview()[0] if keep and self.tree.get_children() else 0.0
         try:
@@ -629,6 +676,10 @@ class Pane(ttk.Frame):
         for e in scanned:
             try:
                 st = e.stat()
+                # 与资源管理器默认视图一致：跳过隐藏/系统属性项
+                #（如 Word 临时文件 ~$*.docx、desktop.ini、$RECYCLE.BIN 等）
+                if st.st_file_attributes & 0x6:  # FILE_ATTRIBUTE_HIDDEN|SYSTEM
+                    continue
                 size, mtime = st.st_size, st.st_mtime
             except OSError:
                 size, mtime = 0, 0.0
@@ -654,12 +705,7 @@ class Pane(ttk.Frame):
         self._fill()
 
     def _fill(self):
-        key_funcs = {
-            "#0": lambda e: e["name"].lower(),
-            "size": lambda e: e["size"],
-            "mtime": lambda e: e["mtime"],
-        }
-        key = key_funcs[self.sort_col]
+        key = _SORT_KEYS[self.sort_col]
         # 目录始终排在文件前面，目录与文件各自按所选列排序
         dirs = sorted((e for e in self._entries if e["is_dir"]),
                       key=key, reverse=self.sort_reverse)
@@ -667,7 +713,7 @@ class Pane(ttk.Frame):
                        key=key, reverse=self.sort_reverse)
         self.tree.delete(*self.tree.get_children())
         # 图标优先用缓存；没缓存的先无图标插入，交给后台线程抓完再补（不阻塞 UI）
-        self._icon_gen = getattr(self, "_icon_gen", 0) + 1
+        self._icon_gen += 1
         pending = {}  # key -> [iid, ...]
         for i, e in enumerate(dirs + files):
             img, text = "", " " + e["name"]
@@ -699,9 +745,9 @@ class Pane(ttk.Frame):
 
     def _apply_icons(self, gen):
         """后台图标抓取完成：给等待中的行补上图标（或 emoji 回退）"""
-        if gen != getattr(self, "_icon_gen", 0):  # 期间又刷新过，结果已过期
+        if gen != self._icon_gen:  # 期间又刷新过，结果已过期
             return
-        pending = getattr(self, "_pending_icons", None)
+        pending = self._pending_icons
         if not pending:
             return
         self._pending_icons = {}
@@ -726,7 +772,7 @@ class Pane(ttk.Frame):
             self.tree.heading(col, text=" " + text)
 
     def _update_status(self):
-        total = len(self.tree.get_children())
+        total = len(self._entries)
         sel = len(self.tree.selection())
         text = f"{total} 个项目"
         if sel:
@@ -735,16 +781,196 @@ class Pane(ttk.Frame):
         self.app.set_status(self)  # 仅当本窗格为焦点窗格时才真正显示
 
     # ---------- 导航 ----------
+    def _navigate(self, path):
+        """所有主动跳转的统一入口：维护后退/前进历史栈"""
+        path = os.path.abspath(path)
+        del self._hist[self._hist_i + 1:]  # 新导航截断 forward 栈
+        if os.path.normcase(self._hist[-1]) != os.path.normcase(path):
+            self._hist.append(path)
+            if len(self._hist) > 100:
+                del self._hist[0]
+        self._hist_i = len(self._hist) - 1
+        self.path = path
+        self.refresh()
+
     def go_up(self):
         parent = os.path.dirname(self.path)
         if parent and parent != self.path:
-            self.path = parent
+            self._navigate(parent)
+
+    def _go_hist(self, idx):
+        """移动历史栈指针到 idx（后退/前进/下拉跳转共用）"""
+        if 0 <= idx < len(self._hist) and idx != self._hist_i:
+            self._hist_i = idx
+            self.path = self._hist[idx]
             self.refresh()
+
+    def go_back(self):
+        self._go_hist(self._hist_i - 1)
+
+    def go_forward(self):
+        self._go_hist(self._hist_i + 1)
+
+    def _jump_history(self, idx):
+        """从历史下拉跳转：移动栈指针（同浏览器点历史条目的语义）"""
+        if idx == self._hist_i:
+            self._close_history_dropdown()  # 点的就是当前目录：收起下拉即可
+            return
+        self._go_hist(idx)
+        self.hide_address()
+        self.tree.focus_set()
+
+    # ---------- 历史下拉（资源管理器/浏览器式，贴着地址栏展开的建议列表） ----------
+    def _hist_candidates(self, needle="", check_exists=True):
+        """历史项：最近在上、按路径去重（大小写不敏感），可按键入词过滤。
+        check_exists=False 用于键入过滤：isdir 对失效网络路径可能阻塞数秒，
+        不能挂在每次按键上；手动展开时才剔除已删目录"""
+        seen, out = set(), []
+        for i in range(len(self._hist) - 1, -1, -1):
+            p = self._hist[i]
+            k = os.path.normcase(p)
+            if k in seen or (check_exists and not os.path.isdir(p)):
+                continue
+            if needle and needle.lower() not in p.lower():
+                continue
+            seen.add(k)
+            out.append((i, p))
+            if len(out) >= 15:
+                break
+        return out
+
+    def _toggle_history_dropdown(self):
+        if self._hist_pop is not None:
+            self._close_history_dropdown()
+        else:
+            self._open_history_dropdown()
+
+    def _open_history_dropdown(self, filtered=False):
+        if self._hist_pop is not None:
+            return
+        needle = self.path_var.get().strip() if filtered else ""
+        items = self._hist_candidates(needle, check_exists=not filtered)
+        if not items:
+            return
+        pop = tk.Toplevel(self)
+        pop.withdraw()  # 先不映射：新 Toplevel 的 geometry 要等空闲周期才生效，
+                        # 直接映射会先以默认位置（屏幕中央）闪现/卡住
+        pop.overrideredirect(True)
+        pop.configure(bg="#c5d3e8")  # 1px 边框效果（Listbox 四周留 1px 底色）
+        lb = tk.Listbox(pop, font=(FONT_FAMILY, FONT_SIZE), bd=0,
+                        highlightthickness=0, activestyle="none",
+                        selectbackground="#cde0f7", selectforeground="black",
+                        exportselection=False)
+        lb.pack(fill="both", expand=True, padx=1, pady=1)
+        self._hist_pop, self._hist_lb = pop, lb
+        self._fill_history_dropdown(items)
+        if not filtered:  # 手动展开时预选当前路径所在项
+            for n, (hi, _p) in enumerate(items):
+                if hi == self._hist_i:
+                    lb.selection_set(n)
+                    lb.see(n)
+                    break
+            else:
+                lb.selection_set(0)
+        else:
+            lb.selection_set(0)
+        pop.update_idletasks()
+        ef = self.entry_frame
+        ef.update_idletasks()  # 地址栏可能刚唤出，先沉降布局再读坐标
+        pop.geometry("{}x{}+{}+{}".format(ef.winfo_width(), pop.winfo_reqheight(),
+                                          ef.winfo_rootx(),
+                                          ef.winfo_rooty() + ef.winfo_height()))
+        lb.bind("<Motion>", self._hist_hover)
+        lb.bind("<ButtonRelease-1>", self._hist_click)
+        # 不用 grab：实测 Tk 在 Windows 下对 toplevel grab_set 后，连子控件 Listbox 的
+        # 真实点击都会被转投给 pop（event.widget=pop），无法区分内外。
+        # 改为资源管理器式非模态关闭：点外部 = entry 失焦（FocusOut 检查）
+        # + 主窗 bind_all Button-1 里关掉不在点击路径上的下拉（见 _on_focus_pane）
+        pop.deiconify()  # 位置就绪后才映射，首次出现即贴在地址栏下缘
+        self.path_entry.focus_set()  # 键盘焦点留在地址栏，↑↓/Enter/Esc 直接可用
+
+    def _fill_history_dropdown(self, items):
+        self._hist_items = items
+        lb = self._hist_lb
+        lb.delete(0, "end")
+        for _hi, p in items:
+            lb.insert("end", " " + p)
+        lb.configure(height=len(items))
+
+    def _close_history_dropdown(self):
+        pop = self._hist_pop
+        if pop is not None:
+            self._hist_pop = None
+            pop.destroy()
+
+    def _hist_focus_check(self):
+        """地址栏失焦后的延时检查：焦点没进下拉列表/▾按钮就收掉下拉"""
+        if self._hist_pop is None:
+            return
+        w = self.focus_get()
+        if w not in (self.path_entry, self._hist_lb, self.hist_btn):
+            self._close_history_dropdown()
+
+    def _hist_move(self, d):
+        lb = self._hist_lb
+        cur = lb.curselection()
+        n = (cur[0] if cur else -1) + d
+        n = min(max(n, 0), len(self._hist_items) - 1)
+        lb.selection_clear(0, "end")
+        lb.selection_set(n)
+        lb.see(n)
+
+    def _hist_hover(self, event):
+        i = self._hist_lb.nearest(event.y)
+        self._hist_lb.selection_clear(0, "end")
+        self._hist_lb.selection_set(i)
+
+    def _hist_click(self, event):
+        i = self._hist_lb.nearest(event.y)
+        if 0 <= i < len(self._hist_items):
+            self._jump_history(self._hist_items[i][0])  # 内部 hide_address 会关下拉
+
+    def _hist_selected_index(self):
+        sel = self._hist_lb.curselection()
+        if sel and 0 <= sel[0] < len(self._hist_items):
+            return self._hist_items[sel[0]][0]
+        return None
+
+    def _on_path_down(self, event):
+        if self._hist_pop is None:
+            self._open_history_dropdown()
+        else:
+            self._hist_move(1)
+        return "break"
+
+    def _on_path_up(self, event):
+        if self._hist_pop is not None:
+            self._hist_move(-1)
+        return "break"
+
+    def _on_path_keyrelease(self, event):
+        """浏览器式：下拉展开期间键入即过滤；未展开时键入且有匹配则自动展开"""
+        if event.keysym in ("Up", "Down", "Left", "Right", "Home", "End",
+                            "Return", "Escape", "Alt_L", "Alt_R",
+                            "Control_L", "Control_R", "Shift_L", "Shift_R"):
+            return
+        if not (event.char and event.char.isprintable()) and \
+                event.keysym not in ("Delete", "BackSpace"):
+            return
+        items = self._hist_candidates(self.path_var.get().strip(),
+                                      check_exists=False)
+        if self._hist_pop is None:
+            if items:
+                self._open_history_dropdown(filtered=True)
+        elif items:
+            self._fill_history_dropdown(items)
+            self._hist_lb.selection_set(0)
+        else:
+            self._close_history_dropdown()  # 键入后无匹配，收起
 
     def open_item(self, iid):
         if os.path.isdir(iid):
-            self.path = os.path.abspath(iid)
-            self.refresh()
+            self._navigate(iid)
         else:
             try:
                 os.startfile(iid)
@@ -761,7 +987,7 @@ class Pane(ttk.Frame):
             row = self.tree.identify_row(event.y)
             # 资源管理器式慢双击改名：唯一选中的项时隔双击间隔后被再次单击
             now = time.time()
-            prev_row, prev_t = getattr(self, "_last_click", (None, 0.0))
+            prev_row, prev_t = self._last_click
             dbl = _user32.GetDoubleClickTime() / 1000
             self._rename_candidate = (
                 row if row and row == prev_row and now - prev_t > dbl
@@ -772,7 +998,8 @@ class Pane(ttk.Frame):
                 self.tree.selection_set()
             self._drag = {"x": event.x, "y": event.y,
                           "additive": ctrl,
-                          "active": False, "base": [], "rect": None}
+                          "active": False, "base": [], "rect": None,
+                          "boxes": None}
         else:
             self._drag = None
             self._rename_candidate = None
@@ -791,13 +1018,19 @@ class Pane(ttk.Frame):
         y0, y1 = sorted((d["y"], event.y))
         rect = (x0, y0, x1, y1)
         hwnd = self.tree.winfo_id()
-        # 与选框相交的行入选（滚出可视区的行没有 bbox，自然排除）
-        sel = []
-        for iid in self.tree.get_children():
-            b = self.tree.bbox(iid)
-            if b and b[0] < x1 and b[0] + b[2] > x0 \
-                    and b[1] < y1 and b[1] + b[3] > y0:
-                sel.append(iid)
+        # 与选框相交的行入选（滚出可视区的行没有 bbox，自然排除）。
+        # 拖动期间各行位置基本不变，bbox 只查一次缓存复用——否则每个 motion
+        # 事件都对全列表做一轮 Tcl 调用，大目录下框选会卡；自动滚动后重建
+        boxes = d["boxes"]
+        if boxes is None:
+            boxes = []
+            for iid in self.tree.get_children():
+                b = self.tree.bbox(iid)
+                if b:
+                    boxes.append((iid, b))
+            d["boxes"] = boxes
+        sel = [iid for iid, b in boxes
+               if b[0] < x1 and b[0] + b[2] > x0 and b[1] < y1 and b[1] + b[3] > y0]
         self.tree.selection_set(d["base"] + sel)
         # 旧框区域标脏；选框推迟到 after_idle 再画——tk 的重绘也在空闲时执行，
         # 同步绘制会被随后的选中态重绘覆盖，等它画完再把选框画在最上层
@@ -811,8 +1044,10 @@ class Pane(ttk.Frame):
         # 拖出上下边缘时自动滚动
         if event.y < 0:
             self.tree.yview_scroll(-1, "units")
+            d["boxes"] = None  # 滚动改变了行位置，缓存失效
         elif event.y > self.tree.winfo_height():
             self.tree.yview_scroll(1, "units")
+            d["boxes"] = None
         return "break"
 
     def _draw_pending_rubber(self):
@@ -830,7 +1065,7 @@ class Pane(ttk.Frame):
             self._rename_candidate = None
             return
         # 没拖动出选框：慢双击的第二次单击落定，进入行内重命名
-        cand = getattr(self, "_rename_candidate", None)
+        cand = self._rename_candidate
         self._rename_candidate = None
         if cand and self.tree.identify_row(event.y) == cand \
                 and list(self.tree.selection()) == [cand]:
@@ -840,7 +1075,7 @@ class Pane(ttk.Frame):
             self._rename_timer = self.after(delay, self._rename_if_still, cand)
 
     def _cancel_pending_rename(self):
-        tid = getattr(self, "_rename_timer", None)
+        tid = self._rename_timer
         if tid:
             self._rename_timer = None
             try:
@@ -856,10 +1091,17 @@ class Pane(ttk.Frame):
 
     # ---------- 事件 ----------
     def _on_path_enter(self, event):
+        # 下拉展开期间回车 = 跳转到当前选中的历史项（同浏览器）
+        if self._hist_pop is not None:
+            idx = self._hist_selected_index()
+            if idx is not None:
+                self._jump_history(idx)  # 内部 hide_address 会关下拉
+            else:
+                self._close_history_dropdown()
+            return "break"
         p = self.path_var.get().strip().strip('"')
         if os.path.isdir(p):
-            self.path = os.path.abspath(p)
-            self.refresh()
+            self._navigate(p)
             self.hide_address()  # 跳转成功，收起地址栏
             self.tree.focus_set()
         else:
@@ -867,7 +1109,10 @@ class Pane(ttk.Frame):
             self.path_var.set(self.path)
 
     def _on_path_escape(self, event):
-        """放弃编辑：恢复当前路径并收起地址栏"""
+        """Esc：下拉展开时先只收下拉（地址栏保持），否则放弃编辑收起地址栏"""
+        if self._hist_pop is not None:
+            self._close_history_dropdown()
+            return "break"
         self.path_var.set(self.path)
         self.hide_address()
         self.tree.focus_set()
@@ -947,7 +1192,7 @@ class Pane(ttk.Frame):
         return "break"
 
     def _paste(self):
-        if getattr(self, "_paste_busy", False):  # 上一次粘贴还在跑，忽略
+        if self._paste_busy:  # 上一次粘贴还在跑，忽略
             return "break"
         clip = get_clipboard_files()
         if not clip:
@@ -1044,7 +1289,7 @@ class Pane(ttk.Frame):
     def _begin_rename(self, iid):
         """行内重命名：在列表项文字区覆盖输入框（资源管理器风格），
         Enter/焦点离开提交，Esc 取消；文件只选中主名（不含扩展名）"""
-        if getattr(self, "_rename_entry", None) is not None:
+        if self._rename_entry is not None:
             return  # 一次只能改一个
         if not self.tree.exists(iid):
             return
@@ -1177,6 +1422,7 @@ class QDirLite(tk.Tk):
         self.minsize(S(600), S(400))
         self.resizable(True, True)  # 窗口可拖拽调整大小
         self.maximized_pane = None
+        self.active_pane = None  # Pane 构造时会回调 set_status，须先存在
         self._saved_geometry = self.geometry()
         self.tk.call("tk", "scaling", _DPI / 72.0)  # 字体随 DPI 缩放
 
@@ -1198,7 +1444,7 @@ class QDirLite(tk.Tk):
         self.status_label.pack(side="left", fill="x", expand=True)
         self.status_label.bind(
             "<Double-1>",
-            lambda e: getattr(self, "active_pane", None)
+            lambda e: self.active_pane
             and self.active_pane._open_in_explorer())
         self._layout_btns = {}
         self._layout_icons = {n: make_layout_icon(n) for n in (1, 2, 3, 4)}
@@ -1227,11 +1473,26 @@ class QDirLite(tk.Tk):
             path = sp.get("path", "")
             if not os.path.isdir(path):
                 path = home  # 上次的目录已不存在，回退主目录
-            pane = Pane(self, self, path)
-            if sp.get("sort_col") in pane._heading_texts:
-                pane.sort_col = sp["sort_col"]
-                pane.sort_reverse = bool(sp.get("sort_reverse"))
-                pane._fill()  # 按恢复的排序方式重排
+            sort_col = sp.get("sort_col")
+            if sort_col not in ("#0", "size", "mtime"):
+                sort_col = "#0"
+            pane = Pane(self, self, path, sort_col,
+                        bool(sp.get("sort_reverse")))
+            # 恢复历史栈；若恢复的路径已变（如原目录被删回退到主目录），以当前路径为准续栈
+            hist = sp.get("history")
+            if isinstance(hist, list):
+                hist = [h for h in hist if isinstance(h, str)][-100:]
+                if hist:
+                    pane._hist = hist
+                    try:
+                        hi = int(sp.get("hist_i", len(hist) - 1))
+                    except (TypeError, ValueError):
+                        hi = len(hist) - 1
+                    pane._hist_i = min(max(hi, 0), len(hist) - 1)
+                    if os.path.normcase(pane._hist[pane._hist_i]) != \
+                            os.path.normcase(pane.path):
+                        pane._hist.append(pane.path)
+                        pane._hist_i = len(pane._hist) - 1
             self.panes.append(pane)
 
         self.layout_n = state.get("layout", 4)
@@ -1311,9 +1572,9 @@ class QDirLite(tk.Tk):
     def _poll_dirs(self):
         """每 2 秒对比各窗格目录的 mtime：外部增删改文件时自动刷新"""
         for p in self.panes:
-            if getattr(p, "_paste_busy", False):
+            if p._paste_busy:
                 continue  # 正在往这个目录粘贴，收尾时会统一刷新
-            old = getattr(p, "_dir_mtime", None)
+            old = p._dir_mtime
             if old is None:
                 continue
             try:
@@ -1372,7 +1633,7 @@ class QDirLite(tk.Tk):
         self._build_layout(n)
         self._update_layout_buttons()
         # 焦点窗格被隐藏时，焦点落到第一个可见窗格
-        if getattr(self, "active_pane", None) not in self.panes[:n if n < 4 else 4]:
+        if self.active_pane not in self.panes[:n]:
             self._on_focus_pane_type(self.panes[0])
 
     def _update_layout_buttons(self):
@@ -1393,7 +1654,7 @@ class QDirLite(tk.Tk):
             zoomed = max_idx is None and self.state() == "zoomed"
             geometry = (self._saved_geometry
                         if (max_idx is not None or zoomed) else self.geometry())
-            active = self.panes.index(getattr(self, "active_pane", self.panes[0]))
+            active = self.panes.index(self.active_pane or self.panes[0])
             state = {
                 "geometry": geometry,
                 "zoomed": zoomed,
@@ -1401,7 +1662,10 @@ class QDirLite(tk.Tk):
                 "active_pane": active,
                 "layout": self.layout_n,
                 "panes": [{"path": p.path, "sort_col": p.sort_col,
-                           "sort_reverse": p.sort_reverse} for p in self.panes],
+                           "sort_reverse": p.sort_reverse,
+                           "history": p._hist[-50:],
+                           "hist_i": p._hist_i - max(0, len(p._hist) - 50)}
+                          for p in self.panes],
             }
             f = _state_file()
             os.makedirs(os.path.dirname(f), exist_ok=True)
@@ -1419,7 +1683,22 @@ class QDirLite(tk.Tk):
                 break
         style.configure("Treeview",
                         font=(FONT_FAMILY, FONT_SIZE), rowheight=S(18),
+                        # 叶子列表用不到展开箭头的缩进区，压到最小避免左侧空白浪费
+                        indent=S(2),
                         background="white", fieldbackground="white")
+        # 再把树列的 indicator（展开箭头占位元素，vista 主题下约 25px 宽）从
+        # Item 布局中剥掉——本程序全是扁平列表没有子节点，这个占位纯属浪费
+        def _strip_indicator(lay):
+            out = []
+            for name, spec in lay:
+                spec = dict(spec)
+                if "children" in spec:
+                    spec["children"] = _strip_indicator(spec["children"])
+                if name != "Treeitem.indicator":
+                    out.append((name, spec))
+            return out
+        style.layout("Treeview.Item",
+                     _strip_indicator(style.layout("Treeview.Item")))
         style.configure("Treeview.Heading", font=(FONT_FAMILY, FONT_SIZE, "bold"),
                         padding=(2, 0))
         style.map("Treeview", background=[("selected", "#cde0f7")],
@@ -1427,6 +1706,14 @@ class QDirLite(tk.Tk):
 
     def _on_focus_pane(self, event):
         w = event.widget
+        if not isinstance(w, tk.Widget):
+            return  # grab 转投的事件 widget 可能是路径字符串，直接忽略
+        # 点了历史下拉以外的任何地方：收掉所有窗格展开中的下拉
+        #（点在列表/地址栏/▾ 上属下拉自身交互，不关）
+        for p in self.panes:
+            if p._hist_pop is not None and w not in (
+                    p._hist_lb, p.path_entry, p.hist_btn):
+                p._close_history_dropdown()
         while w is not None and not isinstance(w, Pane):
             w = w.master
         if w is not None:
@@ -1435,6 +1722,8 @@ class QDirLite(tk.Tk):
     def _on_ctrl_click(self, event):
         """Ctrl+左键：聚焦所在窗格并弹出其地址栏"""
         w = event.widget
+        if not isinstance(w, tk.Widget):
+            return  # 同上：grab 转投时 widget 可能是字符串
         while w is not None and not isinstance(w, Pane):
             w = w.master
         if w is not None:
@@ -1456,7 +1745,7 @@ class QDirLite(tk.Tk):
 
     def set_status(self, pane):
         """统一状态栏：只显示当前焦点窗格的状态"""
-        if getattr(self, "active_pane", None) is pane:
+        if self.active_pane is pane:
             self.status_var.set(f" {pane.path}　{pane._status_text}")
 
     def toggle_maximize(self, pane):
