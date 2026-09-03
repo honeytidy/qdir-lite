@@ -13,6 +13,7 @@ python -m py_compile qdir_lite.py fileicons.py          # 语法检查
 ```
 
 - PyInstaller 在 `.venv` 里（6.x）；spec 单文件、无控制台
+- **Defender 误报**（`Trojan:Win32/Bearfoos.B!ml`，!ml=机器学习静态启发式）：无版本资源的未签名 onefile exe 是高危特征；spec 已挂 `version='version_info.txt'` 嵌入版本资源解决（本机 MpCmdRun 扫描验证通过）。若再误报：① 保持 upx=False（UPX 壳本身招 ML 模型）；② 提交误报 https://www.microsoft.com/en-us/wdsi/filesubmission （签名更新后可能复发，重打包改哈希要重提）；③ 换 onedir 模式（加 COLLECT，exe 变小启动器，极少误报，代价是发行变文件夹）
 - `hiddenimports=['shellmenu']` 因为它是函数内延迟 import；**顶层 import 的模块（如 fileicons）会被自动分析，不用加**
 - 冒烟验证注意：`taskkill //F` 强杀进程不会触发 WM_DELETE_WINDOW，属于预期
 - exe 图标：`make_icon.py` 用纯标准库生成 `app.ico`（16~256 七档尺寸，PNG 压缩块），图案与 `make_app_icon()` 一致；spec 里 `icon='app.ico'` 嵌入
